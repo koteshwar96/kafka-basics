@@ -107,6 +107,7 @@ In case of leader failures, Control plane elects a new leader from the ISR set, 
 When a new leader is elected, its high watermark could be less than the actual high watermark. If this happens, 
 any fetch requests for an offset that is between the current leader’s high watermark and the actual will trigger a retriable OFFSET_NOT_AVAILABLE error.
 The consumer will continue trying to fetch until the high watermark is updated, at which point processing will continue as normal.
+
 ![img_13.png](img_13.png)
 ![img_14.png](img_14.png)
 
@@ -121,6 +122,7 @@ In our example, the request shows that the follower is fetching an offset that i
 When the leader receives the fetch request it will check it against its own log and determine that the offset being requested is not valid for that epoch.
 It will then send a response to the follower telling it what offset that epoch should end at. 
 The follower will use the information in the fetch response to truncate the extraneous data so that it will be in sync with the leader.
+
 ![img_15.png](img_15.png)
 ![img_16.png](img_16.png)
 ![img_17.png](img_17.png)
@@ -134,6 +136,7 @@ The follower will use the information in the fetch response to truncate the extr
 The leader monitors the progress of its followers. If a configurable amount of time elapses since a follower was last fully caught up, 
 the leader will remove that follower from the in-sync replica set. This allows the leader to advance the high watermark so that consumers can continue consuming current data. 
 If the follower comes back online or otherwise gets its act together and catches up to the leader, then it will be added back to the ISR.
+
 ![img_22.png](img_22.png)
 
 As we’ve seen, the broker containing the leader replica does a bit more work than the follower replicas. 
@@ -147,10 +150,202 @@ So, Kafka will periodically check to see if there is an imbalance in leader repl
 It uses a configurable threshold to make this determination. If it does find an imbalance it will perform a leader rebalance to get the leaders back on their preferred replicas.
 
 
+## Control Plane
+
+Old ZooKeeper Design:
+
+The Kafka control plane was managed through an external consensus service called ZooKeeper. 
+One broker is designated as the controller. The controller is responsible for communicating with ZooKeeper and the other brokers in the cluster. 
+The metadata for the cluster is persisted in ZooKeeper.
+
+![img_23.png](img_23.png)
+
+With the release of Apache Kafka 3.3.1 in October 2022, Raft based consensus protocol for metadata management, called KRaft, has been marked as production ready. 
+Running Kafka in Kraft mode eliminates the need to run a Zookeeper cluster alongside every Kafka cluster.
+
+In KRaft, a subset of brokers are designated as controllers, and these controllers provide the consensus services that used to be provided by ZooKeeper. 
+All cluster metadata are now stored in Kafka topics and managed internally.  
+One of the controller brokers will be the active controller and it will handle communicating changes to metadata with the other brokers.
+
+![img_24.png](img_24.png)
+
+We got two options with KRaft mode, i.e. dedicated controller node or shared node
+```aidl
+process.roles=controller or broker or both
+controller.quorum.voters // list of controller nodes set in all brokers
+```
+![img_25.png](img_25.png)
+
+All of the controller brokers maintain an in-memory metadata cache that is kept up to date, so that any controller can take over as the active controller if needed. 
+This is one of the features of KRaft that make it so much more efficient than the ZooKeeper-based control plane.
+
+cluster metadata, reflecting the current state of all controller managed resources, is stored in a single partition Kafka topic called __cluster_metadata. 
+KRaft uses this topic to synchronize cluster state changes across controller and broker nodes.
+rather than the controller broadcasting metadata changes to the other controllers or to brokers, 
+they each fetch the changes. This makes it very efficient
+
+![img_26.png](img_26.png)
+
+Data replication and reconciliation of this meta data topic is very similar to that of data plane topic replication.
+when a leader needs to be elected, this is done via quorum, rather than an in-sync replica set.
+Another difference is that metadata records are flushed to disk immediately as they are written to each node’s local log.
+Leader Election process,
+
+![img_27.png](img_27.png)
+
+![img_28.png](img_28.png)
+
+![img_29.png](img_29.png)
+
+
+**KRaft Cluster Metadata Snapshot**
+
+In KRaft mode, Kafka brokers take periodic snapshots of the metadata cache and store them on disk. Also we don’t want the metadata log to grow endlessly.
+By taking snapshot, Now we know that all data in the metadata log that is older than that offset and epoch is safely stored, and the log can be truncated up to that point.
+The snapshot, together with the remaining data in the metadata log, will still give us the complete metadata for the whole cluster.
+These snapshots are used to speed up the recovery process and to avoid replaying all the log entries from the __cluster_metadata topic when a broker restarts.
+Kafka typically uses the number of snapshots (metadata.snapshot.retention.num) to determine when to delete old snapshots
+
+Two primary uses of the metadata snapshot are broker restarts and new brokers coming online.
+
+When an existing broker restarts, it 
+1. Loads its most recent snapshot into memory.  
+2. Then starting from the EndOffset of its snapshot, it adds available records from its local __cluster_metadata log. 
+3. It then begins fetching records from the active controller. If the fetched record offset is less than the active controller LogStartOffset, the controller response includes the snapshot ID of its latest snapshot. 
+4. The broker then fetches this snapshot and loads it into memory and then once again continues fetching records from the __cluster_metadata partition leader (the active controller).
+
+![img_30.png](img_30.png)
+
+![img_31.png](img_31.png)
+
+
+## Consumer Group
+
+The magic behind consumer groups is provided by the group coordinator. The group coordinator helps to distribute the data in the subscribed topics to the consumer group instances evenly 
+and it keeps things balanced when group membership changes occur. 
+The coordinator uses an internal Kafka topic to keep track of group metadata.
+In a typical Kafka cluster, there will be multiple group coordinators. This allows for multiple consumer groups to be managed efficiently.
+
+**Group StartUp:**
+
+1. **Find the Group Co-ordinator:** When a consumer instance starts up it sends a FindCoordinator request that includes its group.id to any broker in the cluster. 
+The broker will create a hash of the group.id and modulo that against the number of partitions in the internal __consumer_offsets topic. That determines the partition that all metadata events for this group will be written to. 
+The broker that hosts the leader replica for that partition will take on the role of group coordinator for the new consumer group. The broker that received the FindCoordinator request will respond with the endpoint of the group coordinator.
+
+**Note:** The __consumer_offsets topic is a log-compacted topic. This means that older offset records for the same consumer group and partition are eventually removed
+offsets.topic.num.partitions config determines number of partitions for that topic.
+consumer will issue a CommitOffsetRequest to the group coordinator. The coordinator will then persist that information in its internal __consumer_offsets topic.
+
+![img_32.png](img_32.png)
+
+2. **Members Join:**
+
+the consumers and the group coordinator begin a little logistical dance, starting with the consumers sending a JoinGroup request and passing their topic subscription information. 
+The coordinator will choose one consumer, usually the first one to send the JoinGroup request, as the **group leader**. The coordinator will return a memberId to each consumer, but it will also return a list of all members and the subscription info to the group leader. 
+The reason for this is so that the group leader can do the actual partition assignment using a **configurable partition assignment strategy**.
+
+![img_33.png](img_33.png)
+
+3. **Partitions Assigned**
+
+After the group leader receives the complete member list and subscription information, it will use its configured partitioner to assign the partitions in the subscription to the group members.
+With that done, the leader will send a SyncGroupRequest to the coordinator, passing in its memberId and the group assignments provided by its partitioner. 
+The other consumers will make a similar request but will only pass their memberId. The coordinator will use the assignment information given to it by the group leader to return the actual assignments to each consumer. Now the consumers can begin their real work of consuming and processing data.
+
+![img_34.png](img_34.png)
+
+
+**Range Partition Assignment Strategy**
+
+1. **Range assignment strategy:**  
+
+This strategy goes through each topic in the subscription and assigns each of the partitions to a consumer, starting at the first consumer. What this means is that the first partition of each topic will be assigned to the first consumer, the second partition of each topic will be assigned to the second consumer, and so on. If no single topic in the subscription has as many partitions as there are consumers, then some consumers will be idle.
+
+![img_35.png](img_35.png)
+
+2. **Round Robin and Sticky Partition Assignment Strategies**
+
+this strategy, all of the partitions of the subscription, regardless of topic, will be spread evenly across the available consumers. This results in fewer idle consumer instances and a higher degree of parallelism.
+
+A variant of Round Robin, called the Sticky Partition strategy, operates on the same principle but it makes a best effort at sticking to the previous assignment during a rebalance. This provides a faster, more efficient rebalance.
+
+![img_36.png](img_36.png)
+
+3. **CooperativeSticky Assignment Strategy:** 
+
+A variant of the StickyAssignor that supports incremental cooperative rebalancing, where consumers can join and leave without triggering a full rebalance 
+i.e. when a consumer goes down, it doesnt immediately trigger rebalance, it waits for some time (config property) and if it joins back, it gets its partitions back
+
+When a consumer rejoins, it will send an OffsetFetchRequest to the group coordinator to retrieve the last committed offset for its assigned partition. Once it has the offset, it will resume the consumption from that point.
+
+If its joining newly, then the auto.offset.reset configuration will determine whether it begins consuming from the earliest offset or the latest.
+
+**Note:** If different clients of the same consumer provides different strategy, then Kafka consumer group coordinator will enforce one strategy across the group.
+It is advised though that, all provide same strategy
+
+
+**Consumer Group Rebalance Triggers**
+
+Group Rebalance can be triggered in below scenarios,
+* An instance fails to send a heartbeat to the coordinator before the timeout and is removed from the group
+* An instance has been added to the group
+* Partitions have been added to a topic in the group’s subscription
+* A group has a wildcard subscription and a new matching topic is created
+* And, of course, initial group startup
+
+The re balance process begins with the coordinator notifying the consumer instances that a rebalance has begun. 
+It does this by piggybacking on the HeartbeatResponse or the OffsetFetchResponse.
+
+ partition.assignment.strategy config lets us select appropriate strategy
+
+![img_37.png](img_37.png)
+
+
+**Stop-the-World Rebalance:**
+
+The Stop-the-World Rebalance strategy in Kafka refers to a traditional approach to rebalancing where all consumers in a group are paused during a rebalance.
+This strategy is typically associated with the default rebalancing strategies like RangeAssignor or RoundRobinAssignor.
+
+![img_38.png](img_38.png)
+
+**Note:** Partition state for a consumer generally includes The current position in the partition, Messages that have been fetched but not yet processed or committed
+,  Any in-memory data or cache related to the processing of the partition, Offsets that have been processed but not yet committed.
+
+We have two problems with this approach,
+1. Rebuilding state
+2. Processing Paused
+
+Avoid Needless State Rebuild with StickyAssignor
+
+![img_39.png](img_39.png)
+
+Avoid Pause with CooperativeStickyAssignor
+
+![img_40.png](img_40.png)
+
+Avoid Rebalance with Static Group Membership:
+
+With static group membership each consumer instance is assigned a group.instance.id. Also, when a consumer instance leaves gracefully it will not send a LeaveGroup request to the coordinator, 
+so no rebalance is started. When the same instance rejoins the group, 
+the coordinator will recognize it and allow it to continue with its existing partition assignments. Again, no rebalance needed.
+
+![img_41.png](img_41.png)
 
 
 
 
+
+
+
+### Questions:
+Do we still use zero copy principle in case we don't have enough data to send for consumer request? 
+As there was a mention of purgatory map incase data is not ready or enough.
+
+Quick question in case of leader failure, 
+lets say we set min ISR to 2 and replica factor set to 3.
+Now, follower 1 is fully caught up with leader and follower2 is just lagging behind with maybe 3-4 of records(< replica.lag.time.max.ms) , as min ISR is set to 2, leader has advanced the high watermark i.e. committed the records.
+Now if the leader fails, and follower 2 is elected as the new leader and starts accepting the produce requests.
+Now How does the Reconciliation happen and what happens to the records that weren't caught by initial follower 2 i.e. new leader
 
 
 
