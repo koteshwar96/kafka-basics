@@ -149,6 +149,33 @@ As leader elections occur for various reasons, the leaders might end up on non-p
 So, Kafka will periodically check to see if there is an imbalance in leader replicas. 
 It uses a configurable threshold to make this determination. If it does find an imbalance it will perform a leader rebalance to get the leaders back on their preferred replicas.
 
+**Durability:**
+
+A producer sends a produce request to the partition leader, when should the leader send the ack to the producer so that our data is durable and our system is highly available
+
+if we set 
+
+acks config value to zero -> then producer doesn;t wait for any leader response at all
+
+acks config value to one -> then producer sends response as soon the data is written in its commit log. But what if the leader goes down immediately ?
+
+acks config value set to all -> Now producer sends ok only after all followers have the data, but this will take more time (2.5x) and what if one follower node is down, producer will not accept any requests now
+
+min.insync.replica config lets us decide what should be the min isr set size before leader sends ok to producer. 
+
+So, with replication set to 5, min isr to 3 and ack=all, we can accept requests from producer even if two brokers are down and data is still available in 3 nodes.
+
+**Producer Idempotence and ordering Guarantee**
+
+Leader broker failures can cause duplicate events to be written to the partition which will throw off the ordering. In order to solve this, we need to enable idempotence (enable.idempotence = true)
+
+By enabling this, brokers will also get Pid, seq no details. So, before adding logs/data broker can check if this out of seq or not for the given PId
+
+![img_42.png](img_42.png)
+
+Combining acks=all, producer idempotence, and keyed events results in a powerful end-to-end ordering guarantee. Events with a specific key will always land 
+in a specific partition in the order they are sent, and consumers will always read them from that specific partition in that exact order.
+
 
 ## Control Plane
 
@@ -346,6 +373,16 @@ lets say we set min ISR to 2 and replica factor set to 3.
 Now, follower 1 is fully caught up with leader and follower2 is just lagging behind with maybe 3-4 of records(< replica.lag.time.max.ms) , as min ISR is set to 2, leader has advanced the high watermark i.e. committed the records.
 Now if the leader fails, and follower 2 is elected as the new leader and starts accepting the produce requests.
 Now How does the Reconciliation happen and what happens to the records that weren't caught by initial follower 2 i.e. new leader
+
+
+I have an application which reads data from topic1 and after processing the event from topic1 it needs to publish data to topic2 and topic3. 
+I want this entire reading, processing and writing to two topic to be in a transaction. 
+How can i do this in kafka using its transaction and how will the consumers of topic2 and topic3 read with isolation level set as read_comitted as 
+we have events to topic2 and topic3 from various similar application instances processing the data from topic1
+
+is transaction.id and PID 1:1 mapping ? What happens if a single instance is doing multiple transactions on various threads ?
+Doesnt all the transactions logs go to the same partition of the __transaction_state topic 
+
 
 
 
